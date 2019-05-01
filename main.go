@@ -245,6 +245,31 @@ func (app *proxyApp) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 			req.RemoteAddr, req.Method, req.URL, req.Proto)
 	}
 
+	// Parse client IP
+	clientIPStr, _, err := net.SplitHostPort(req.RemoteAddr)
+	if err != nil {
+		app.handleRequestError(rw, req, err)
+		return
+	}
+	clientIP := net.ParseIP(clientIPStr)
+	if clientIP == nil {
+		app.handleRequestError(rw, req, fmt.Errorf("invalid client IP address"))
+		return
+	}
+
+	// Check client access
+	allowed := false
+	for _, cidrNet := range app.AllowedNetworks {
+		if cidrNet.Contains(clientIP) {
+			allowed = true
+			break
+		}
+	}
+	if !allowed {
+		rw.WriteHeader(http.StatusForbidden)
+		return
+	}
+
 	transport := app.Transport
 	if transport == nil {
 		transport = http.DefaultTransport

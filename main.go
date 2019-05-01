@@ -72,6 +72,7 @@ type proxyApp struct {
 		listen       string
 		cidrFile     string
 		timeout      string
+		debug        bool
 		printVersion bool
 		printHelp    bool
 		printHelp2   bool
@@ -81,9 +82,9 @@ type proxyApp struct {
 	err      error
 }
 
-// switchProtocolCopier exists so goroutines proxying data back and
+// hijackCopier exists so goroutines proxying data back and
 // forth have nice names in stacks.
-type switchProtocolCopier struct {
+type hijackCopier struct {
 	client, server io.ReadWriter
 }
 
@@ -135,6 +136,7 @@ func main() {
 	flag.StringVar(&app.flags.listen, "listen", "", "Listen address in the format of <ip>:<port>")
 	flag.StringVar(&app.flags.cidrFile, "cidrfile", "", "Path to file containing newline-separated CIDR prefixes that are allowed access, 0.0.0.0/0 / ::/0 is allowed if not specified")
 	flag.StringVar(&app.flags.timeout, "timeout", "30s", "Request timeout")
+	flag.BoolVar(&app.flags.debug, "debug", false, "Enable debug logging")
 	flag.BoolVar(&app.flags.printVersion, "version", false, "Print version and exit")
 	flag.BoolVar(&app.flags.printHelp, "h", false, "Show this help menu")
 	flag.BoolVar(&app.flags.printHelp2, "help", false, "Show this help menu")
@@ -238,6 +240,11 @@ func (app *proxyApp) logf(format string, v ...interface{}) {
 }
 
 func (app *proxyApp) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
+	if app.flags.debug {
+		app.logf("[debug] client %s request \"%s %v %s\"",
+			req.RemoteAddr, req.Method, req.URL, req.Proto)
+	}
+
 	transport := app.Transport
 	if transport == nil {
 		transport = http.DefaultTransport
@@ -257,6 +264,17 @@ func (app *proxyApp) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 			case <-ctx.Done():
 			}
 		}()
+	}
+
+	// Handle CONNECT request
+	if req.Method == http.MethodConnect {
+		conn, err := net.DialTimeout("tcp", req.Host, app.Timeout)
+		if err != nil {
+			app.handleRequestError(rw, req, err)
+			return
+		}
+		app.handleHijack(rw, req, nil, conn)
+		return
 	}
 
 	// Create new outgoing request from client request
@@ -445,17 +463,26 @@ func (app *proxyApp) handleUpgradeResponse(rw http.ResponseWriter, req *http.Req
 		return
 	}
 
-	copyHeader(res.Header, rw.Header())
+	app.handleHijack(rw, req, res, nil)
+}
 
+func (app *proxyApp) handleHijack(rw http.ResponseWriter, req *http.Request, res *http.Response, backConn io.ReadWriteCloser) {
+	if res != nil {
+		copyHeader(res.Header, rw.Header())
+	}
+
+	rw.WriteHeader(http.StatusOK)
 	hj, ok := rw.(http.Hijacker)
 	if !ok {
 		app.handleRequestError(rw, req, fmt.Errorf("can't switch protocols using non-Hijacker ResponseWriter type %T", rw))
 		return
 	}
-	backConn, ok := res.Body.(io.ReadWriteCloser)
-	if !ok {
-		app.handleRequestError(rw, req, fmt.Errorf("internal error: 101 switching protocols response with non-writable body"))
-		return
+	if backConn == nil {
+		backConn, ok = res.Body.(io.ReadWriteCloser)
+		if !ok {
+			app.handleRequestError(rw, req, fmt.Errorf("internal error: 101 switching protocols response with non-writable body"))
+			return
+		}
 	}
 	defer backConn.Close()
 	conn, brw, err := hj.Hijack()
@@ -464,29 +491,33 @@ func (app *proxyApp) handleUpgradeResponse(rw http.ResponseWriter, req *http.Req
 		return
 	}
 	defer conn.Close()
-	res.Body = nil // so res.Write only writes the headers; we have res.Body in backConn above
-	if err := res.Write(brw); err != nil {
-		app.handleRequestError(rw, req, fmt.Errorf("response write: %v", err))
-		return
-	}
-	if err := brw.Flush(); err != nil {
-		app.handleRequestError(rw, req, fmt.Errorf("response flush: %v", err))
-		return
+	if res != nil {
+		res.Body = nil // so res.Write only writes the headers; we have res.Body in backConn above
+		if err := res.Write(brw); err != nil {
+			app.handleRequestError(rw, req, fmt.Errorf("response write: %v", err))
+			return
+		}
+		if err := brw.Flush(); err != nil {
+			app.handleRequestError(rw, req, fmt.Errorf("response flush: %v", err))
+			return
+		}
 	}
 	errc := make(chan error, 1)
-	spc := switchProtocolCopier{client: conn, server: backConn}
+	spc := hijackCopier{client: conn, server: backConn}
 	go spc.copyToServer(errc)
 	go spc.copyFromServer(errc)
-	<-errc
+	if err := <-errc; err != nil {
+		app.logf("[error] hijack copy error: %v", err)
+	}
 	return
 }
 
-func (c switchProtocolCopier) copyFromServer(errc chan<- error) {
+func (c hijackCopier) copyFromServer(errc chan<- error) {
 	_, err := io.Copy(c.client, c.server)
 	errc <- err
 }
 
-func (c switchProtocolCopier) copyToServer(errc chan<- error) {
+func (c hijackCopier) copyToServer(errc chan<- error) {
 	_, err := io.Copy(c.server, c.client)
 	errc <- err
 }

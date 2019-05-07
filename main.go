@@ -11,6 +11,7 @@ import (
 	"bufio"
 	"context"
 	"errors"
+	"expvar"
 	"flag"
 	"fmt"
 	"io"
@@ -18,8 +19,10 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/net/http/httpguts"
@@ -29,7 +32,11 @@ import (
 type proxyApp struct {
 	// AllowedNetworks specifies a list of networks
 	// that are allowed to use the proxy
-	AllowedNetworks []*net.IPNet
+	ProxyAllowedNetworks []*net.IPNet
+
+	// DirectAllowedNetworks specifies a list of networks
+	// that are allowed to use the stats endpoint
+	DirectAllowedNetworks []*net.IPNet
 
 	// Timeout specifies a global proxy request timeout
 	Timeout time.Duration
@@ -61,17 +68,23 @@ type proxyApp struct {
 	BufferPool httputil.BufferPool
 
 	flags struct {
-		listen       string
-		cidrFile     string
-		timeout      string
-		debug        bool
-		printVersion bool
-		printHelp    bool
-		printHelp2   bool
+		listen         string
+		cidrFile       string
+		directCidrFile string
+		timeout        string
+		debug          bool
+		printVersion   bool
+		printHelp      bool
+		printHelp2     bool
 	}
 
-	listener net.Listener
-	err      error
+	stats struct {
+		proxyRequests expvarUint64
+	}
+
+	expvarHandler http.Handler
+	listener      net.Listener
+	err           error
 }
 
 // hijackCopier exists so goroutines proxying data back and
@@ -106,6 +119,26 @@ func (bp *bufferPool) Put(b []byte) {
 	bp.pool.Put(b)
 }
 
+type expvarUint64 struct {
+	i uint64
+}
+
+func (v *expvarUint64) String() string {
+	return strconv.FormatUint(atomic.LoadUint64(&v.i), 10)
+}
+
+func (v *expvarUint64) Set(value uint64) {
+	atomic.StoreUint64(&v.i, value)
+}
+
+func (v *expvarUint64) Add() {
+	atomic.AddUint64(&v.i, 1)
+}
+
+func (v *expvarUint64) Sub() {
+	atomic.StoreUint64(&v.i, ^uint64(0))
+}
+
 var app *proxyApp
 var version = "unknown"
 var osarch = "unknown"
@@ -128,19 +161,18 @@ var hopHeaders = []string{
 }
 
 func main() {
-	app = &proxyApp{
-		BufferPool: newBufferPool(),
-	}
-	var f *os.File
-	var scanner *bufio.Scanner
-	var cidrNet *net.IPNet
 	var laddr *net.TCPAddr
+	app = &proxyApp{
+		BufferPool:    newBufferPool(),
+		expvarHandler: expvar.Handler(),
+	}
 
 	// Tell systemd that we're getting ready
 	systemdNotify("STATUS=alexproxy starting")
 
 	flag.StringVar(&app.flags.listen, "listen", "", "Listen address in the format of <ip>:<port>")
 	flag.StringVar(&app.flags.cidrFile, "cidrfile", "", "Path to file containing newline-separated CIDR prefixes that are allowed access, 0.0.0.0/0 / ::/0 is allowed if not specified")
+	flag.StringVar(&app.flags.directCidrFile, "direct-cidrfile", "", "Path to file containing newline-separated CIDR prefixes that are allowed access to direct endpoint, 127.0.0.0/8 / ::1/128 is allowed if not specified")
 	flag.StringVar(&app.flags.timeout, "timeout", "30s", "Request timeout")
 	flag.BoolVar(&app.flags.debug, "debug", false, "Enable debug logging")
 	flag.BoolVar(&app.flags.printVersion, "version", false, "Print version and exit")
@@ -165,32 +197,35 @@ func main() {
 
 	if app.flags.cidrFile != "" {
 		// Parse cidr access list
-		if f, app.err = os.Open(app.flags.cidrFile); app.err != nil {
-			f.Close()
+		if app.ProxyAllowedNetworks, app.err = parseCidrFile(app.flags.cidrFile); app.err != nil {
 			goto END
 		}
-		scanner = bufio.NewScanner(f)
-		for scanner.Scan() {
-			if _, cidrNet, app.err = net.ParseCIDR(scanner.Text()); app.err != nil {
-				f.Close()
-				goto END
-			}
-			app.AllowedNetworks = append(app.AllowedNetworks, cidrNet)
-		}
-		if app.err = scanner.Err(); app.err != nil {
-			f.Close()
-			goto END
-		}
-		f.Close()
 	} else {
 		// Give access to 0.0.0.0/0, ::/0 if no cidr list is specified
-		app.AllowedNetworks = append(app.AllowedNetworks, &net.IPNet{
+		app.ProxyAllowedNetworks = append(app.ProxyAllowedNetworks, &net.IPNet{
 			IP:   net.IPv4zero,
 			Mask: net.IPMask(net.IPv4zero),
 		})
-		app.AllowedNetworks = append(app.AllowedNetworks, &net.IPNet{
+		app.ProxyAllowedNetworks = append(app.ProxyAllowedNetworks, &net.IPNet{
 			IP:   net.IPv6zero,
 			Mask: net.IPMask(net.IPv6zero),
+		})
+	}
+
+	if app.flags.directCidrFile != "" {
+		// Parse cidr access list
+		if app.DirectAllowedNetworks, app.err = parseCidrFile(app.flags.directCidrFile); app.err != nil {
+			goto END
+		}
+	} else {
+		// Give access to 127.0.0.0/8, ::1/128 if no cidr list is specified
+		app.DirectAllowedNetworks = append(app.DirectAllowedNetworks, &net.IPNet{
+			IP:   net.IPv4(127, 0, 0, 0),
+			Mask: net.IPv4Mask(255, 0, 0, 0),
+		})
+		app.DirectAllowedNetworks = append(app.DirectAllowedNetworks, &net.IPNet{
+			IP:   net.IPv6loopback,
+			Mask: net.IPMask([]byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff}),
 		})
 	}
 
@@ -222,6 +257,9 @@ func main() {
 		Timeout:   app.Timeout,
 	}
 
+	// Publish expvar variables
+	expvar.Publish("proxyRequests", &app.stats.proxyRequests)
+
 	// Tell systemd that we're up and ready
 	systemdNotify("READY=1")
 	systemdNotify("STATUS=alexproxy started")
@@ -246,30 +284,53 @@ func (app *proxyApp) logf(format string, v ...interface{}) {
 }
 
 func (app *proxyApp) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
+	app.stats.proxyRequests.Add()
+	defer app.stats.proxyRequests.Sub()
+
 	if app.flags.debug {
 		app.logf("[debug] client %s request \"%s %v %s\"",
 			req.RemoteAddr, req.Method, req.URL, req.Proto)
 	}
 
-	// Parse client IP
-	clientIPStr, _, err := net.SplitHostPort(req.RemoteAddr)
-	if err != nil {
-		app.handleRequestError(rw, req, err)
-		return
-	}
-	clientIP := net.ParseIP(clientIPStr)
-	if clientIP == nil {
-		app.handleRequestError(rw, req, fmt.Errorf("invalid client IP address"))
+	// Direct requests
+	if req.Method != http.MethodConnect && !req.URL.IsAbs() {
+		// Check client access for direct request
+		allowed, err := checkCidrAccess(req.RemoteAddr, app.DirectAllowedNetworks)
+		if err != nil {
+			app.handleRequestError(rw, req, err)
+			return
+		}
+		if !allowed {
+			rw.WriteHeader(http.StatusForbidden)
+			return
+		}
+
+		// Handle direct request
+		if req.URL.Path == "/debug/status" {
+			if req.Method == http.MethodGet || req.Method == http.MethodHead {
+				rw.WriteHeader(http.StatusOK)
+			} else {
+				rw.WriteHeader(http.StatusMethodNotAllowed)
+			}
+			return
+		} else if req.URL.Path == "/debug/vars" {
+			if req.Method == http.MethodGet {
+				app.expvarHandler.ServeHTTP(rw, req)
+			} else {
+				rw.WriteHeader(http.StatusMethodNotAllowed)
+			}
+			return
+		}
+
+		rw.WriteHeader(http.StatusNotFound)
 		return
 	}
 
-	// Check client access
-	allowed := false
-	for _, cidrNet := range app.AllowedNetworks {
-		if cidrNet.Contains(clientIP) {
-			allowed = true
-			break
-		}
+	// Check client access for proxy request
+	allowed, err := checkCidrAccess(req.RemoteAddr, app.ProxyAllowedNetworks)
+	if err != nil {
+		app.handleRequestError(rw, req, err)
+		return
 	}
 	if !allowed {
 		rw.WriteHeader(http.StatusForbidden)
@@ -637,6 +698,44 @@ func removeConnectionHeaders(h http.Header) {
 			}
 		}
 	}
+}
+
+func parseCidrFile(filename string) (networks []*net.IPNet, err error) {
+	var f *os.File
+	var network *net.IPNet
+	if f, err = os.Open(filename); err != nil {
+		return
+	}
+	defer f.Close()
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		if _, network, err = net.ParseCIDR(scanner.Text()); err != nil {
+			return
+		}
+		networks = append(networks, network)
+	}
+	err = scanner.Err()
+	return
+}
+
+func checkCidrAccess(hostport string, networks []*net.IPNet) (bool, error) {
+	// Parse client IP
+	clientIPStr, _, err := net.SplitHostPort(hostport)
+	if err != nil {
+		return false, err
+	}
+	clientIP := net.ParseIP(clientIPStr)
+	if clientIP == nil {
+		return false, fmt.Errorf("invalid client IP address")
+	}
+
+	// Check client access
+	for _, cidrNet := range networks {
+		if cidrNet.Contains(clientIP) {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func systemdNotify(message string) error {

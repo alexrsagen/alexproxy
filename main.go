@@ -5,14 +5,6 @@
 // Modifications to aforementioned parts and the rest of the source
 // is Copyright 2019 Alexander Sagen.
 
-// spec:
-// - support HTTP_PROXY & HTTPS_PROXY env and the protocol behind it
-//   - GET / xxxx for http
-//   - CONNECT for https
-// - run as systemd daemon
-// - listen addr in args
-// - tcp
-// - no ssl on listen
 package main
 
 import (
@@ -102,6 +94,18 @@ type maxLatencyWriter struct {
 	flushPending bool
 }
 
+type bufferPool struct {
+	pool *sync.Pool
+}
+
+func (bp *bufferPool) Get() []byte {
+	return bp.pool.Get().([]byte)
+}
+
+func (bp *bufferPool) Put(b []byte) {
+	bp.pool.Put(b)
+}
+
 var app *proxyApp
 var version = "unknown"
 var osarch = "unknown"
@@ -124,7 +128,9 @@ var hopHeaders = []string{
 }
 
 func main() {
-	app = &proxyApp{}
+	app = &proxyApp{
+		BufferPool: newBufferPool(),
+	}
 	var f *os.File
 	var scanner *bufio.Scanner
 	var cidrNet *net.IPNet
@@ -583,6 +589,16 @@ func (m *maxLatencyWriter) stop() {
 	m.flushPending = false
 	if m.t != nil {
 		m.t.Stop()
+	}
+}
+
+func newBufferPool() *bufferPool {
+	return &bufferPool{
+		pool: &sync.Pool{
+			New: func() interface{} {
+				return make([]byte, 32*1024)
+			},
+		},
 	}
 }
 

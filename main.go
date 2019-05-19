@@ -79,7 +79,7 @@ type proxyApp struct {
 	}
 
 	stats struct {
-		proxyRequests expvarUint64
+		proxyRequests expvarInt64
 	}
 
 	expvarHandler http.Handler
@@ -119,24 +119,24 @@ func (bp *bufferPool) Put(b []byte) {
 	bp.pool.Put(b)
 }
 
-type expvarUint64 struct {
-	i uint64
+type expvarInt64 struct {
+	i int64
 }
 
-func (v *expvarUint64) String() string {
-	return strconv.FormatUint(atomic.LoadUint64(&v.i), 10)
+func (v *expvarInt64) String() string {
+	return strconv.FormatInt(atomic.LoadInt64(&v.i), 10)
 }
 
-func (v *expvarUint64) Set(value uint64) {
-	atomic.StoreUint64(&v.i, value)
+func (v *expvarInt64) Set(value int64) {
+	atomic.StoreInt64(&v.i, value)
 }
 
-func (v *expvarUint64) Add() {
-	atomic.AddUint64(&v.i, 1)
+func (v *expvarInt64) Add() {
+	atomic.AddInt64(&v.i, 1)
 }
 
-func (v *expvarUint64) Sub() {
-	atomic.StoreUint64(&v.i, ^uint64(0))
+func (v *expvarInt64) Sub() {
+	atomic.StoreInt64(&v.i, -1)
 }
 
 var app *proxyApp
